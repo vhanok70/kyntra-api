@@ -96,7 +96,7 @@ app.get('/auth/figma', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
 
   const state = Buffer.from(JSON.stringify({ userId: user.id })).toString('base64');
-  const redirectUri = 'http://localhost:4000/auth/figma/callback';
+  const redirectUri = 'https://kyntra-api.onrender.com/auth/figma/callback';
   const url = `https://www.figma.com/oauth?client_id=${FIGMA_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=file_read&state=${state}&response_type=code`;
   res.json({ url });
 });
@@ -110,7 +110,7 @@ app.get('/auth/figma/callback', async (req, res) => {
     const tokenRes = await axios.post('https://www.figma.com/api/oauth/token', {
       client_id: FIGMA_CLIENT_ID,
       client_secret: FIGMA_CLIENT_SECRET,
-      redirect_uri: 'http://localhost:4000/auth/figma/callback',
+      redirect_uri: 'https://kyntra-api.onrender.com/auth/figma/callback',
       code,
       grant_type: 'authorization_code'
     });
@@ -122,7 +122,7 @@ app.get('/auth/figma/callback', async (req, res) => {
       [userId, 'figma', tokenRes.data.access_token]
     );
 
-    res.redirect('http://localhost:3000/profile?connected=figma');
+    res.redirect('https://kyntra-pi.vercel.app/profile?connected=figma');
   } catch (error) {
     console.error('Figma OAuth error:', error);
     res.status(500).json({ error: 'Figma auth failed' });
@@ -135,7 +135,7 @@ app.get('/auth/notion', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
 
   const state = Buffer.from(JSON.stringify({ userId: user.id })).toString('base64');
-  const redirectUri = encodeURIComponent('http://localhost:4000/auth/notion/callback');
+  const redirectUri = encodeURIComponent('https://kyntra-api.onrender.com/auth/notion/callback');
   const url = `https://api.notion.com/v1/oauth/authorize?client_id=${NOTION_CLIENT_ID}&redirect_uri=${redirectUri}&response_type=code&state=${state}`;
   res.json({ url });
 });
@@ -149,7 +149,7 @@ app.get('/auth/notion/callback', async (req, res) => {
     const tokenRes = await axios.post('https://api.notion.com/v1/oauth/token', {
       grant_type: 'authorization_code',
       code,
-      redirect_uri: 'http://localhost:4000/auth/notion/callback'
+      redirect_uri: 'https://kyntra-api.onrender.com/auth/notion/callback'
     }, {
       auth: { username: NOTION_CLIENT_ID, password: NOTION_CLIENT_SECRET },
       headers: { 'Content-Type': 'application/json' }
@@ -162,7 +162,7 @@ app.get('/auth/notion/callback', async (req, res) => {
       [userId, 'notion', tokenRes.data.access_token]
     );
 
-    res.redirect('http://localhost:3000/profile?connected=notion');
+    res.redirect('https://kyntra-pi.vercel.app/profile?connected=notion');
   } catch (error) {
     console.error('Notion OAuth error:', error);
     res.status(500).json({ error: 'Notion auth failed' });
