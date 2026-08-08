@@ -46,7 +46,7 @@ async function getUserFromToken(authHeader: string | undefined) {
 
 // ========== GITHUB OAUTH ==========
 app.get('/auth/github', (req, res) => {
-  const redirectUri = 'http://localhost:4000/auth/github/callback';
+  const redirectUri = 'https://kyntra-api.onrender.com/auth/github/callback';
   const url = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${redirectUri}&scope=user:email,read:user`;
   res.json({ url });
 });
@@ -83,7 +83,7 @@ app.get('/auth/github/callback', async (req, res) => {
     );
 
     const token = jwt.sign({ userId: githubUser.id, username: githubUser.login }, JWT_SECRET, { expiresIn: '7d' });
-    res.redirect(`http://localhost:3000/auth/callback?token=${token}`);
+    res.redirect(`https://kyntra-pi.vercel.app/auth/callback?token=${token}`);
   } catch (error) {
     console.error('OAuth error:', error);
     res.status(500).json({ error: 'Authentication failed' });
