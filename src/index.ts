@@ -518,6 +518,34 @@ app.post('/messages/:id/respond', async (req, res) => {
   }
 });
 
+// ========== DISCOVER USERS ==========
+app.get('/discover/users', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  try {
+    const db = await getDb();
+    const users = await db.all(
+      `SELECT username, name, avatar_url, bio 
+       FROM users 
+       WHERE id != ? 
+       ORDER BY created_at DESC 
+       LIMIT 20`,
+      [user.id]
+    );
+
+    res.json(users.map(u => ({
+      username: u.username,
+      name: u.name || u.username,
+      avatar: u.avatar_url,
+      bio: u.bio || 'No bio yet'
+    })));
+  } catch (error) {
+    console.error('Discover error:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
 // START SERVER
 initDb().then(() => {
   console.log('✅ SQLite database initialized');
