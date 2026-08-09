@@ -781,6 +781,46 @@ Be specific. Reference actual skills.`
   }
 });
 
+// ========== SEARCH DEVELOPERS ==========
+app.get('/discover/search', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  const { q } = req.query;
+  if (!q || typeof q !== 'string') {
+    return res.status(400).json({ error: 'Query required' });
+  }
+
+  try {
+    const db = await getDb();
+    const searchTerm = `%${q.toLowerCase()}%`;
+    
+    const result = await db.query(
+      `SELECT username, name, avatar_url, bio, skill_graph 
+       FROM users 
+       WHERE id != $1 AND (
+         LOWER(username) LIKE $2 OR 
+         LOWER(name) LIKE $2 OR 
+         LOWER(bio) LIKE $2 OR
+         skill_graph::text ILIKE $2
+       )
+       LIMIT 20`,
+      [user.id, searchTerm]
+    );
+
+    res.json(result.rows.map((u: any) => ({
+      username: u.username,
+      name: u.name || u.username,
+      avatar: u.avatar_url,
+      bio: u.bio || 'No bio yet',
+      skillGraph: u.skill_graph
+    })));
+  } catch (error) {
+    console.error('Search error:', error);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
 // START SERVER
 initDb().then(() => {
   app.listen(PORT, () => {
