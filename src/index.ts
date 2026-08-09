@@ -71,7 +71,6 @@ app.get('/auth/github/callback', async (req, res) => {
 
     const db = await getDb();
     
-    // Upsert user
     await db.query(
       `INSERT INTO users (github_id, username, email, avatar_url, name, bio, access_token) 
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -682,7 +681,6 @@ ${workContext}`
   }
 });
 
-// ========== AI-POWERED DISCOVER ==========
 // ========== AI-POWERED DISCOVER ==========
 app.get('/discover/matches', async (req, res) => {
   const user = await getUserFromToken(req.headers.authorization);
