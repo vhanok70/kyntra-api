@@ -194,6 +194,84 @@ app.get('/me', async (req, res) => {
   });
 });
 
+// ========== GITHUB TIMELINE ==========
+app.get('/github/timeline', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Invalid token' });
+
+  try {
+    // Fetch user's repos
+    const reposRes = await axios.get('https://api.github.com/user/repos?sort=updated&per_page=6&affiliation=owner,collaborator', {
+      headers: { Authorization: `Bearer ${user.access_token}` }
+    });
+
+    // Fetch public events (commits, PRs, etc.)
+    const eventsRes = await axios.get(`https://api.github.com/users/${user.username}/events/public?per_page=30`, {
+      headers: { Authorization: `Bearer ${user.access_token}` }
+    });
+
+    // Process events into timeline
+    const timeline: any[] = [];
+    const seen = new Set();
+
+    for (const event of eventsRes.data) {
+      const key = `${event.type}-${event.repo.name}-${event.created_at}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      if (event.type === 'PushEvent') {
+        const commits = event.payload.commits || [];
+        if (commits.length > 0) {
+          timeline.push({
+            type: 'commit',
+            repo: event.repo.name,
+            message: commits[0].message,
+            commits: commits.length,
+            date: event.created_at,
+            sha: commits[0].sha.substring(0, 7)
+          });
+        }
+      } else if (event.type === 'PullRequestEvent') {
+        const pr = event.payload.pull_request;
+        timeline.push({
+          type: 'pr',
+          repo: event.repo.name,
+          title: pr.title,
+          action: event.payload.action,
+          merged: pr.merged,
+          date: event.created_at,
+          number: pr.number
+        });
+      } else if (event.type === 'CreateEvent' && event.payload.ref_type === 'repository') {
+        timeline.push({
+          type: 'repo',
+          repo: event.repo.name,
+          date: event.created_at
+        });
+      }
+
+      if (timeline.length >= 12) break;
+    }
+
+    res.json({
+      repos: reposRes.data.map((r: any) => ({
+        name: r.name,
+        full_name: r.full_name,
+        description: r.description,
+        stars: r.stargazers_count,
+        language: r.language,
+        updated_at: r.updated_at,
+        url: r.html_url,
+        forks: r.forks_count
+      })),
+      timeline
+    });
+  } catch (error) {
+    console.error('GitHub timeline error:', error);
+    res.status(500).json({ error: 'Failed to fetch GitHub data' });
+  }
+});
+
 // START SERVER
 initDb().then(() => {
   console.log('✅ SQLite database initialized');
