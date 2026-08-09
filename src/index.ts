@@ -4,6 +4,39 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { initDb, getDb } from './db';
+import { Resend } from 'resend';
+const resend = new Resend(process.env.RESEND_API_KEY || '');
+
+
+// ========== EMAIL NOTIFICATIONS ==========
+async function sendMessageEmail(receiverEmail: string, senderName: string, messagePreview: string, stakeAmount: number) {
+  if (!process.env.RESEND_API_KEY) return;
+  
+  try {
+    await resend.emails.send({
+      from: 'KYNTRA <notifications@kyntra.dev>',
+      to: receiverEmail,
+      subject: stakeAmount > 0 
+        ? `${senderName} staked ${stakeAmount} KYN to message you` 
+        : `${senderName} sent you a message on KYNTRA`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #1e293b;">New Message on KYNTRA</h2>
+          <p><strong>${senderName}</strong> sent you a message:</p>
+          <div style="background: #f8fafc; border-left: 4px solid #7c3aed; padding: 15px; margin: 15px 0; border-radius: 8px;">
+            <p style="margin: 0; color: #334155;">"${messagePreview}"</p>
+          </div>
+          ${stakeAmount > 0 ? `<p style="color: #d97706; font-weight: bold;">⚡ Stake: ${stakeAmount} KYN</p>` : ''}
+          <a href="https://kyntra-pi.vercel.app/message" style="display: inline-block; background: #0f172a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; margin-top: 15px; font-weight: bold;">Reply on KYNTRA</a>
+          <p style="color: #94a3b8; font-size: 12px; margin-top: 20px;">You're receiving this because you have a KYNTRA account.</p>
+        </div>
+      `
+    });
+    console.log('📧 Email sent to', receiverEmail);
+  } catch (err) {
+    console.error('Email failed:', err);
+  }
+}
 
 dotenv.config();
 
@@ -414,23 +447,29 @@ app.post('/messages/send', async (req, res) => {
     if (!receiver) return res.status(404).json({ error: 'Receiver not found' });
     if (receiver.id === user.id) return res.status(400).json({ error: 'Cannot message yourself' });
 
-    const result = await db.query(
+        const result = await db.query(
       `INSERT INTO messages (sender_id, receiver_id, content, stake_amount, status) 
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id`,
       [user.id, receiver.id, content, stake_amount, 'pending']
     );
 
+    // Send email notification
+    const senderResult = await db.query('SELECT name FROM users WHERE id = $1', [user.id]);
+    const senderName = senderResult.rows[0]?.name || user.username;
+    
+    const receiverEmailResult = await db.query('SELECT email FROM users WHERE id = $1', [receiver.id]);
+    const receiverEmail = receiverEmailResult.rows[0]?.email;
+    
+    if (receiverEmail) {
+      sendMessageEmail(receiverEmail, senderName, content.substring(0, 100), stake_amount);
+    }
+
     res.json({ 
       success: true, 
       message_id: result.rows[0].id,
       stake: stake_amount 
     });
-  } catch (error) {
-    console.error('Send message error:', error);
-    res.status(500).json({ error: 'Failed to send message' });
-  }
-});
 
 app.get('/messages/conversations', async (req, res) => {
   const user = await getUserFromToken(req.headers.authorization);
