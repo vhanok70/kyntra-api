@@ -37,8 +37,8 @@ async function getUserFromToken(authHeader: string | undefined) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as any;
     const db = await getDb();
-    const user = await db.get('SELECT * FROM users WHERE github_id = ?', [decoded.userId]);
-    return user;
+    const result = await db.query('SELECT * FROM users WHERE github_id = $1', [decoded.userId]);
+    return result.rows[0] || null;
   } catch {
     return null;
   }
@@ -69,16 +69,24 @@ app.get('/auth/github/callback', async (req, res) => {
     const githubUser = userRes.data;
 
     const db = await getDb();
-    await db.run(
-      `INSERT OR REPLACE INTO users (github_id, username, email, avatar_url, name, bio, access_token) 
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    
+    // Upsert user
+    await db.query(
+      `INSERT INTO users (github_id, username, email, avatar_url, name, bio, access_token) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (github_id) 
+       DO UPDATE SET username = $2, email = $3, avatar_url = $4, name = $5, bio = $6, access_token = $7`,
       [githubUser.id, githubUser.login, githubUser.email, githubUser.avatar_url, githubUser.name, githubUser.bio, accessToken]
     );
 
-    const user = await db.get('SELECT id FROM users WHERE github_id = ?', [githubUser.id]);
-    await db.run(
-      `INSERT OR REPLACE INTO connections (user_id, provider, provider_user_id, access_token) 
-       VALUES (?, ?, ?, ?)`,
+    const userResult = await db.query('SELECT id FROM users WHERE github_id = $1', [githubUser.id]);
+    const user = userResult.rows[0];
+
+    await db.query(
+      `INSERT INTO connections (user_id, provider, provider_user_id, access_token) 
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, provider) 
+       DO UPDATE SET access_token = $4`,
       [user.id, 'github', githubUser.id, accessToken]
     );
 
@@ -116,9 +124,11 @@ app.get('/auth/figma/callback', async (req, res) => {
     });
 
     const db = await getDb();
-    await db.run(
-      `INSERT OR REPLACE INTO connections (user_id, provider, access_token) 
-       VALUES (?, ?, ?)`,
+    await db.query(
+      `INSERT INTO connections (user_id, provider, access_token) 
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, provider) 
+       DO UPDATE SET access_token = $3`,
       [userId, 'figma', tokenRes.data.access_token]
     );
 
@@ -156,9 +166,11 @@ app.get('/auth/notion/callback', async (req, res) => {
     });
 
     const db = await getDb();
-    await db.run(
-      `INSERT OR REPLACE INTO connections (user_id, provider, access_token) 
-       VALUES (?, ?, ?)`,
+    await db.query(
+      `INSERT INTO connections (user_id, provider, access_token) 
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, provider) 
+       DO UPDATE SET access_token = $3`,
       [userId, 'notion', tokenRes.data.access_token]
     );
 
@@ -175,8 +187,8 @@ app.get('/connections', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
 
   const db = await getDb();
-  const connections = await db.all('SELECT provider, connected_at FROM connections WHERE user_id = ?', [user.id]);
-  res.json(connections);
+  const result = await db.query('SELECT provider, connected_at FROM connections WHERE user_id = $1', [user.id]);
+  res.json(result.rows);
 });
 
 // ========== GET CURRENT USER ==========
@@ -200,17 +212,14 @@ app.get('/github/timeline', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Invalid token' });
 
   try {
-    // Fetch user's repos
     const reposRes = await axios.get('https://api.github.com/user/repos?sort=updated&per_page=6&affiliation=owner,collaborator', {
       headers: { Authorization: `Bearer ${user.access_token}` }
     });
 
-    // Fetch public events (commits, PRs, etc.)
     const eventsRes = await axios.get(`https://api.github.com/users/${user.username}/events/public?per_page=30`, {
       headers: { Authorization: `Bearer ${user.access_token}` }
     });
 
-    // Process events into timeline
     const timeline: any[] = [];
     const seen = new Set();
 
@@ -278,11 +287,11 @@ app.get('/public/profile/:username', async (req, res) => {
   
   try {
     const db = await getDb();
-    const user = await db.get('SELECT * FROM users WHERE username = ?', [username]);
+    const userResult = await db.query('SELECT * FROM users WHERE username = $1', [username]);
+    const user = userResult.rows[0];
     
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Fetch GitHub data using stored token
     const reposRes = await axios.get('https://api.github.com/user/repos?sort=updated&per_page=6&affiliation=owner,collaborator', {
       headers: { Authorization: `Bearer ${user.access_token}` }
     });
@@ -291,7 +300,6 @@ app.get('/public/profile/:username', async (req, res) => {
       headers: { Authorization: `Bearer ${user.access_token}` }
     });
 
-    // Process timeline
     const timeline: any[] = [];
     const seen = new Set();
 
@@ -359,9 +367,35 @@ app.get('/public/profile/:username', async (req, res) => {
   }
 });
 
-// ========== MESSAGING ==========
+// ========== DISCOVER USERS ==========
+app.get('/discover/users', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
 
-// Send a staked message
+  try {
+    const db = await getDb();
+    const result = await db.query(
+      `SELECT username, name, avatar_url, bio 
+       FROM users 
+       WHERE id != $1 
+       ORDER BY created_at DESC 
+       LIMIT 20`,
+      [user.id]
+    );
+
+    res.json(result.rows.map((u: any) => ({
+      username: u.username,
+      name: u.name || u.username,
+      avatar: u.avatar_url,
+      bio: u.bio || 'No bio yet'
+    })));
+  } catch (error) {
+    console.error('Discover error:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// ========== MESSAGING ==========
 app.post('/messages/send', async (req, res) => {
   const user = await getUserFromToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
@@ -374,20 +408,22 @@ app.post('/messages/send', async (req, res) => {
   try {
     const db = await getDb();
     
-    // Find receiver
-    const receiver = await db.get('SELECT id FROM users WHERE username = ?', [receiver_username]);
+    const receiverResult = await db.query('SELECT id FROM users WHERE username = $1', [receiver_username]);
+    const receiver = receiverResult.rows[0];
+    
     if (!receiver) return res.status(404).json({ error: 'Receiver not found' });
     if (receiver.id === user.id) return res.status(400).json({ error: 'Cannot message yourself' });
 
-    const result = await db.run(
+    const result = await db.query(
       `INSERT INTO messages (sender_id, receiver_id, content, stake_amount, status) 
-       VALUES (?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
       [user.id, receiver.id, content, stake_amount, 'pending']
     );
 
     res.json({ 
       success: true, 
-      message_id: result.lastID,
+      message_id: result.rows[0].id,
       stake: stake_amount 
     });
   } catch (error) {
@@ -396,15 +432,14 @@ app.post('/messages/send', async (req, res) => {
   }
 });
 
-// Get conversations list (who you've messaged or who messaged you)
 app.get('/messages/conversations', async (req, res) => {
   const user = await getUserFromToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
 
   try {
     const db = await getDb();
-    const conversations = await db.all(`
-      SELECT 
+    const result = await db.query(`
+      SELECT DISTINCT ON (u.id)
         u.username,
         u.name,
         u.avatar_url,
@@ -414,22 +449,16 @@ app.get('/messages/conversations', async (req, res) => {
         m.created_at,
         m.sender_id,
         (SELECT COUNT(*) FROM messages 
-         WHERE sender_id = u.id AND receiver_id = ? AND status = 'pending') as unread_count
+         WHERE sender_id = u.id AND receiver_id = $1 AND status = 'pending') as unread_count
       FROM messages m
       JOIN users u ON (
-        (m.sender_id = ? AND m.receiver_id = u.id) OR 
-        (m.receiver_id = ? AND m.sender_id = u.id)
+        (m.sender_id = $1 AND m.receiver_id = u.id) OR 
+        (m.receiver_id = $1 AND m.sender_id = u.id)
       )
-      WHERE m.id = (
-        SELECT id FROM messages 
-        WHERE (sender_id = ? AND receiver_id = u.id) OR (sender_id = u.id AND receiver_id = ?)
-        ORDER BY created_at DESC LIMIT 1
-      )
-      GROUP BY u.id
-      ORDER BY m.created_at DESC
-    `, [user.id, user.id, user.id, user.id, user.id]);
+      ORDER BY u.id, m.created_at DESC
+    `, [user.id]);
 
-    res.json(conversations.map(c => ({
+    res.json(result.rows.map((c: any) => ({
       username: c.username,
       name: c.name,
       avatar: c.avatar_url,
@@ -438,7 +467,7 @@ app.get('/messages/conversations', async (req, res) => {
       status: c.status,
       date: c.created_at,
       isIncoming: c.sender_id !== user.id,
-      unread: c.unread_count
+      unread: parseInt(c.unread_count)
     })));
   } catch (error) {
     console.error('Conversations error:', error);
@@ -446,7 +475,6 @@ app.get('/messages/conversations', async (req, res) => {
   }
 });
 
-// Get messages between current user and another user
 app.get('/messages/:username', async (req, res) => {
   const user = await getUserFromToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
@@ -455,18 +483,20 @@ app.get('/messages/:username', async (req, res) => {
   
   try {
     const db = await getDb();
-    const other = await db.get('SELECT id FROM users WHERE username = ?', [username]);
+    const otherResult = await db.query('SELECT id FROM users WHERE username = $1', [username]);
+    const other = otherResult.rows[0];
+    
     if (!other) return res.status(404).json({ error: 'User not found' });
 
-    const messages = await db.all(`
+    const result = await db.query(`
       SELECT m.*, s.username as sender_username, s.avatar_url as sender_avatar
       FROM messages m
       JOIN users s ON m.sender_id = s.id
-      WHERE (m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?)
+      WHERE (m.sender_id = $1 AND m.receiver_id = $2) OR (m.sender_id = $2 AND m.receiver_id = $1)
       ORDER BY m.created_at ASC
-    `, [user.id, other.id, other.id, user.id]);
+    `, [user.id, other.id]);
 
-    res.json(messages.map(m => ({
+    res.json(result.rows.map((m: any) => ({
       id: m.id,
       content: m.content,
       stake: m.stake_amount,
@@ -482,13 +512,12 @@ app.get('/messages/:username', async (req, res) => {
   }
 });
 
-// Respond to a message (accept/reject)
 app.post('/messages/:id/respond', async (req, res) => {
   const user = await getUserFromToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
 
   const { id } = req.params;
-  const { action } = req.body; // 'accept' or 'reject'
+  const { action } = req.body;
 
   if (!['accept', 'reject'].includes(action)) {
     return res.status(400).json({ error: 'Action must be accept or reject' });
@@ -496,16 +525,17 @@ app.post('/messages/:id/respond', async (req, res) => {
 
   try {
     const db = await getDb();
-    const message = await db.get(
-      'SELECT * FROM messages WHERE id = ? AND receiver_id = ?',
+    const msgResult = await db.query(
+      'SELECT * FROM messages WHERE id = $1 AND receiver_id = $2',
       [id, user.id]
     );
+    const message = msgResult.rows[0];
 
     if (!message) return res.status(404).json({ error: 'Message not found' });
     if (message.status !== 'pending') return res.status(400).json({ error: 'Already responded' });
 
     const newStatus = action === 'accept' ? 'accepted' : 'rejected';
-    await db.run('UPDATE messages SET status = ? WHERE id = ?', [newStatus, id]);
+    await db.query('UPDATE messages SET status = $1 WHERE id = $2', [newStatus, id]);
 
     res.json({ 
       success: true, 
@@ -518,39 +548,10 @@ app.post('/messages/:id/respond', async (req, res) => {
   }
 });
 
-// ========== DISCOVER USERS ==========
-app.get('/discover/users', async (req, res) => {
-  const user = await getUserFromToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'Not authenticated' });
-
-  try {
-    const db = await getDb();
-    const users = await db.all(
-      `SELECT username, name, avatar_url, bio 
-       FROM users 
-       WHERE id != ? 
-       ORDER BY created_at DESC 
-       LIMIT 20`,
-      [user.id]
-    );
-
-    res.json(users.map(u => ({
-      username: u.username,
-      name: u.name || u.username,
-      avatar: u.avatar_url,
-      bio: u.bio || 'No bio yet'
-    })));
-  } catch (error) {
-    console.error('Discover error:', error);
-    res.status(500).json({ error: 'Failed to fetch users' });
-  }
-});
-
 // START SERVER
 initDb().then(() => {
-  console.log('✅ SQLite database initialized');
   app.listen(PORT, () => {
-    console.log(`🚀 KYNTRA API running on http://localhost:${PORT}`);
+    console.log(`🚀 KYNTRA API running on port ${PORT}`);
   });
 }).catch((err) => {
   console.error('Failed to initialize database:', err);
