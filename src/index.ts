@@ -1,3 +1,4 @@
+import OpenAI from 'openai';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -29,6 +30,7 @@ const FIGMA_CLIENT_ID = process.env.FIGMA_CLIENT_ID || '';
 const FIGMA_CLIENT_SECRET = process.env.FIGMA_CLIENT_SECRET || '';
 const NOTION_CLIENT_ID = process.env.NOTION_CLIENT_ID || '';
 const NOTION_CLIENT_SECRET = process.env.NOTION_CLIENT_SECRET || '';
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
 
 // Helper to get user from JWT
 async function getUserFromToken(authHeader: string | undefined) {
@@ -545,6 +547,236 @@ app.post('/messages/:id/respond', async (req, res) => {
   } catch (error) {
     console.error('Respond error:', error);
     res.status(500).json({ error: 'Failed to respond' });
+  }
+});
+
+// ========== AI SEMANTIC SKILL GRAPH ==========
+
+async function fetchGitHubWorkSamples(accessToken: string, username: string) {
+  try {
+    const [reposRes, eventsRes] = await Promise.all([
+      axios.get('https://api.github.com/user/repos?sort=updated&per_page=10&affiliation=owner,collaborator', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      }),
+      axios.get(`https://api.github.com/users/${username}/events/public?per_page=20`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      })
+    ]);
+
+    const repos = reposRes.data.map((r: any) => ({
+      name: r.name,
+      description: r.description || '',
+      language: r.language || 'Unknown',
+      stars: r.stargazers_count,
+      topics: r.topics || []
+    }));
+
+    const events = eventsRes.data
+      .filter((e: any) => ['PushEvent', 'PullRequestEvent', 'CreateEvent'].includes(e.type))
+      .map((e: any) => {
+        if (e.type === 'PushEvent') {
+          const commits = e.payload.commits || [];
+          return `Pushed to ${e.repo.name}: ${commits.map((c: any) => c.message).join('; ')}`;
+        }
+        if (e.type === 'PullRequestEvent') {
+          return `PR ${e.payload.action} in ${e.repo.name}: ${e.payload.pull_request?.title || ''}`;
+        }
+        if (e.type === 'CreateEvent' && e.payload.ref_type === 'repository') {
+          return `Created repository ${e.repo.name}`;
+        }
+        return '';
+      })
+      .filter(Boolean);
+
+    return { repos, events };
+  } catch (error) {
+    console.error('GitHub fetch error:', error);
+    return { repos: [], events: [] };
+  }
+}
+
+app.post('/ai/generate-skill-graph', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: 'AI not configured' });
+  }
+
+  try {
+    const { repos, events } = await fetchGitHubWorkSamples(user.access_token, user.username);
+    
+    const workContext = `
+GITHUB REPOSITORIES:
+${repos.map((r: any) => `- ${r.name} (${r.language}, ${r.stars} stars): ${r.description} [Topics: ${r.topics.join(', ') || 'none'}]`).join('\n')}
+
+RECENT ACTIVITY:
+${events.slice(0, 15).join('\n')}
+
+USER BIO: ${user.bio || 'None'}
+`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are an expert technical recruiter and engineering manager who deeply understands software architecture. 
+Analyze the developer's work artifacts and generate a "skill fingerprint" — a semantic understanding of what they actually build, not just what languages they use.
+
+Return ONLY valid JSON. No markdown, no explanation.`
+        },
+        {
+          role: 'user',
+          content: `Analyze this developer's work and return a JSON object with this exact structure:
+
+{
+  "deep_skills": ["specific capabilities inferred from work, e.g. 'WebSocket architecture', 'OAuth 2.0 implementation', 'Database sharding'"],
+  "tech_stack": {
+    "primary": ["main languages/frameworks they actually ship with"],
+    "secondary": ["things they touch occasionally"],
+    "infrastructure": ["databases, cloud, devops tools"]
+  },
+  "architecture_patterns": ["patterns evident in their work, e.g. 'Event-driven', 'Microservices', 'Monolith refactoring'"],
+  "collaboration_style": "One sentence: how they work with others based on PRs and commits",
+  "impact_areas": ["domains they impact, e.g. 'Developer tooling', 'Real-time systems', 'API platforms'"],
+  "experience_level": "Junior / Mid / Senior / Staff",
+  "complementary_to": ["types of people/teams who would benefit most from working with them"],
+  "unique_signals": ["rare or distinctive capabilities that make them stand out"],
+  "summary": "One compelling sentence describing what this developer uniquely brings"
+}
+
+Work artifacts:
+${workContext}`
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 1500
+    });
+
+    const aiResponse = completion.choices[0].message.content || '{}';
+    const skillGraph = JSON.parse(aiResponse);
+
+    const db = await getDb();
+    await db.query(
+      'UPDATE users SET skill_graph = $1 WHERE id = $2',
+      [JSON.stringify(skillGraph), user.id]
+    );
+
+    res.json({ success: true, skill_graph: skillGraph });
+  } catch (error) {
+    console.error('AI generation error:', error);
+    res.status(500).json({ error: 'Failed to generate skill graph' });
+  }
+});
+
+app.get('/ai/skill-graph', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  try {
+    const db = await getDb();
+    const result = await db.query('SELECT skill_graph FROM users WHERE id = $1', [user.id]);
+    const graph = result.rows[0]?.skill_graph;
+    
+    if (!graph) {
+      return res.status(404).json({ error: 'No skill graph yet. Generate one first.' });
+    }
+    
+    res.json(graph);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch skill graph' });
+  }
+});
+
+// ========== AI-POWERED DISCOVER ==========
+app.get('/discover/matches', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  try {
+    const db = await getDb();
+    
+    // Get current user's skill graph
+    const meResult = await db.query('SELECT skill_graph FROM users WHERE id = $1', [user.id]);
+    const myGraph = meResult.rows[0]?.skill_graph;
+    
+    if (!myGraph) {
+      return res.status(400).json({ error: 'Generate your skill graph first' });
+    }
+
+    // Get other users with skill graphs
+    const othersResult = await db.query(
+      `SELECT id, username, name, avatar_url, bio, skill_graph 
+       FROM users 
+       WHERE id != $1 AND skill_graph IS NOT NULL
+       LIMIT 10`,
+      [user.id]
+    );
+
+    if (othersResult.rows.length === 0) {
+      return res.json({ matches: [] });
+    }
+
+    // Build matching prompt
+    const matchesContext = othersResult.rows.map((u: any) => `
+USER: ${u.name} (@${u.username})
+BIO: ${u.bio || 'None'}
+SKILLS: ${JSON.stringify(u.skill_graph)}
+`).join('\n---\n');
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a world-class engineering team builder. You understand that great teams are built on COMPLEMENTARY skills, not identical ones.`
+        },
+        {
+          role: 'user',
+          content: `I am a developer with this skill fingerprint:
+${JSON.stringify(myGraph, null, 2)}
+
+Here are other developers on the platform:
+${matchesContext}
+
+For EACH developer above, analyze how we would complement each other in a work context. Return ONLY a JSON array in this exact format:
+
+[
+  {
+    "username": "their username",
+    "match_score": 0-100,
+    "match_type": "complementary" | "similar" | "mentor" | "mentee",
+    "reasoning": "One sentence explaining why we should connect",
+    "collaboration_potential": "What we could build together"
+  }
+]
+
+Be specific. Reference actual skills. Don't be generic.`
+        }
+      ],
+      temperature: 0.4,
+      max_tokens: 2000
+    });
+
+    const aiResponse = completion.choices[0].message.content || '[]';
+    const matchResults = JSON.parse(aiResponse);
+
+    // Merge with user data
+    const enrichedMatches = matchResults.map((match: any) => {
+      const userData = othersResult.rows.find((u: any) => u.username === match.username);
+      return {
+        ...match,
+        name: userData?.name || match.username,
+        avatar: userData?.avatar_url,
+        bio: userData?.bio
+      };
+    }).sort((a: any, b: any) => b.match_score - a.match_score);
+
+    res.json({ matches: enrichedMatches });
+  } catch (error) {
+    console.error('AI matching error:', error);
+    res.status(500).json({ error: 'Failed to generate matches' });
   }
 });
 

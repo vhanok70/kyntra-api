@@ -23,6 +23,7 @@ export async function initDb() {
         name TEXT,
         bio TEXT,
         access_token TEXT,
+        skill_graph JSONB,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -52,13 +53,8 @@ export async function initDb() {
       )
     `);
 
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id)
-    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id)`);
 
     console.log('✅ PostgreSQL tables initialized');
   } finally {
