@@ -359,6 +359,165 @@ app.get('/public/profile/:username', async (req, res) => {
   }
 });
 
+// ========== MESSAGING ==========
+
+// Send a staked message
+app.post('/messages/send', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  const { receiver_username, content, stake_amount = 0 } = req.body;
+  if (!receiver_username || !content) {
+    return res.status(400).json({ error: 'receiver_username and content required' });
+  }
+
+  try {
+    const db = await getDb();
+    
+    // Find receiver
+    const receiver = await db.get('SELECT id FROM users WHERE username = ?', [receiver_username]);
+    if (!receiver) return res.status(404).json({ error: 'Receiver not found' });
+    if (receiver.id === user.id) return res.status(400).json({ error: 'Cannot message yourself' });
+
+    const result = await db.run(
+      `INSERT INTO messages (sender_id, receiver_id, content, stake_amount, status) 
+       VALUES (?, ?, ?, ?, ?)`,
+      [user.id, receiver.id, content, stake_amount, 'pending']
+    );
+
+    res.json({ 
+      success: true, 
+      message_id: result.lastID,
+      stake: stake_amount 
+    });
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// Get conversations list (who you've messaged or who messaged you)
+app.get('/messages/conversations', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  try {
+    const db = await getDb();
+    const conversations = await db.all(`
+      SELECT 
+        u.username,
+        u.name,
+        u.avatar_url,
+        m.content as last_message,
+        m.stake_amount,
+        m.status,
+        m.created_at,
+        m.sender_id,
+        (SELECT COUNT(*) FROM messages 
+         WHERE sender_id = u.id AND receiver_id = ? AND status = 'pending') as unread_count
+      FROM messages m
+      JOIN users u ON (
+        (m.sender_id = ? AND m.receiver_id = u.id) OR 
+        (m.receiver_id = ? AND m.sender_id = u.id)
+      )
+      WHERE m.id = (
+        SELECT id FROM messages 
+        WHERE (sender_id = ? AND receiver_id = u.id) OR (sender_id = u.id AND receiver_id = ?)
+        ORDER BY created_at DESC LIMIT 1
+      )
+      GROUP BY u.id
+      ORDER BY m.created_at DESC
+    `, [user.id, user.id, user.id, user.id, user.id]);
+
+    res.json(conversations.map(c => ({
+      username: c.username,
+      name: c.name,
+      avatar: c.avatar_url,
+      lastMessage: c.last_message,
+      stake: c.stake_amount,
+      status: c.status,
+      date: c.created_at,
+      isIncoming: c.sender_id !== user.id,
+      unread: c.unread_count
+    })));
+  } catch (error) {
+    console.error('Conversations error:', error);
+    res.status(500).json({ error: 'Failed to fetch conversations' });
+  }
+});
+
+// Get messages between current user and another user
+app.get('/messages/:username', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  const { username } = req.params;
+  
+  try {
+    const db = await getDb();
+    const other = await db.get('SELECT id FROM users WHERE username = ?', [username]);
+    if (!other) return res.status(404).json({ error: 'User not found' });
+
+    const messages = await db.all(`
+      SELECT m.*, s.username as sender_username, s.avatar_url as sender_avatar
+      FROM messages m
+      JOIN users s ON m.sender_id = s.id
+      WHERE (m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?)
+      ORDER BY m.created_at ASC
+    `, [user.id, other.id, other.id, user.id]);
+
+    res.json(messages.map(m => ({
+      id: m.id,
+      content: m.content,
+      stake: m.stake_amount,
+      status: m.status,
+      date: m.created_at,
+      sender: m.sender_username,
+      senderAvatar: m.sender_avatar,
+      isMine: m.sender_id === user.id
+    })));
+  } catch (error) {
+    console.error('Messages error:', error);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// Respond to a message (accept/reject)
+app.post('/messages/:id/respond', async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+  const { id } = req.params;
+  const { action } = req.body; // 'accept' or 'reject'
+
+  if (!['accept', 'reject'].includes(action)) {
+    return res.status(400).json({ error: 'Action must be accept or reject' });
+  }
+
+  try {
+    const db = await getDb();
+    const message = await db.get(
+      'SELECT * FROM messages WHERE id = ? AND receiver_id = ?',
+      [id, user.id]
+    );
+
+    if (!message) return res.status(404).json({ error: 'Message not found' });
+    if (message.status !== 'pending') return res.status(400).json({ error: 'Already responded' });
+
+    const newStatus = action === 'accept' ? 'accepted' : 'rejected';
+    await db.run('UPDATE messages SET status = ? WHERE id = ?', [newStatus, id]);
+
+    res.json({ 
+      success: true, 
+      status: newStatus,
+      stake: action === 'accept' ? message.stake_amount : 0
+    });
+  } catch (error) {
+    console.error('Respond error:', error);
+    res.status(500).json({ error: 'Failed to respond' });
+  }
+});
+
 // START SERVER
 initDb().then(() => {
   console.log('✅ SQLite database initialized');
